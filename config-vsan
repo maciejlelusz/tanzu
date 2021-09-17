@@ -1,0 +1,198 @@
+# Author: William Lam
+# Website: www.williamlam.com
+
+# Nested ESXi VMs to deploy
+$NestedESXiHostnameToIPs = @{
+    "tanzu-esxi-1" = "192.168.1.221"
+    "tanzu-esxi-2" = "192.168.1.222"
+    "tanzu-esxi-3" = "192.168.1.223"
+}
+
+# VCSA Deployment Configuration
+$VCSADeploymentSize = "tiny"
+$VCSADisplayName = "vcsa-mgmt"
+$VCSAIPAddress = "192.168.1.35"
+$VCSAHostname = "vcsa-mgmt.int.inleo.pl" #Change to IP if you don't have valid DNS
+$VCSAPrefix = "24"
+$VCSASSODomainName = "inleo.lab"
+$VCSASSOPassword = "XXX"
+$VCSARootPassword = "XXX"
+$VCSASSHEnable = "true"
+
+# General Deployment Configuration for Nested ESXi, VCSA & HA Proxy VM
+$VMDatacenter = "INLEO"
+$VMCluster = "Podmiejska"
+$VMNetwork = "Lab-MGMT"
+$VMDatastore = "esxi-1-physical-ds3-nvme"
+$VMNetmask = "255.255.255.0"
+$VMGateway = "192.168.1.1"
+$VMDNS = "192.168.1.30"
+$VMNTP = "pl.pool.ntp.org"
+$VMPassword = "VMware1!"
+$VMDomain = "int.inleo.pl"
+$VMSyslog = "192.168.1.30"
+$VMFolder = "Tanzu"
+# Applicable to Nested ESXi only
+$VMSSH = "true"
+$VMVMFS = "false"
+
+# Name of new vSphere Datacenter/Cluster when VCSA is deployed
+$NewVCDatacenterName = "Tanzu-Datacenter"
+$NewVCVSANClusterName = "Workload-Cluster"
+$NewVCVDSName = "Tanzu-VDS"
+$NewVCMgmtPortgroupName = "DVPG-Supervisor-Management-Network"
+$NewVCWorkloadPortgroupName = "DVPG-Workload-Network"
+
+# Tanzu Configuration
+$StoragePolicyName = "tanzu-gold-storage-policy"
+$StoragePolicyTagCategory = "tanzu-demo-tag-category"
+$StoragePolicyTagName = "tanzu-demo-storage"
+$DevOpsUsername = "devops"
+$DevOpsPassword = "VMware1!"
+
+# Advanced Configurations
+# Set to 1 only if you have DNS (forward/reverse) for ESXi hostnames
+$addHostByDnsName = 1
+
+#### DO NOT EDIT BEYOND HERE ####
+
+$debug = $true
+$verboseLogFile = "tanzu-basic-lab-deployment.log"
+
+$esxiTotalCPU = 0
+$vcsaTotalCPU = 0
+$esxiTotalMemory = 0
+$vcsaTotalMemory = 0
+$esxiTotalStorage = 0
+$vcsaTotalStorage = 0
+
+$StartTime = Get-Date
+
+Function My-Logger {
+    param(
+    [Parameter(Mandatory=$true)]
+    [String]$message
+    )
+
+    $timeStamp = Get-Date -Format "MM-dd-yyyy_hh:mm:ss"
+
+    Write-Host -NoNewline -ForegroundColor White "[$timestamp]"
+    Write-Host -ForegroundColor Green " $message"
+    $logMessage = "[$timeStamp] $message"
+    $logMessage | Out-File -Append -LiteralPath $verboseLogFile
+}
+
+My-Logger "Enabling VSAN & disabling VSAN Health Check ..."
+Get-VsanClusterConfiguration -Server $vc -Cluster $NewVCVSANClusterName | Set-VsanClusterConfiguration -HealthCheckIntervalMinutes 0 | Out-File -Append -LiteralPath $verboseLogFile
+
+foreach ($vmhost in Get-Cluster -Server $vc | Get-VMHost) {
+    $luns = $vmhost | Get-ScsiLun | select CanonicalName, CapacityGB
+    My-Logger "Querying ESXi host disks to create VSAN Diskgroups ..."
+    
+    foreach ($lun in $luns) {
+        if(([int]($lun.CapacityGB)).toString() -eq "$NestedESXiCachingvDisk") {
+            $vsanCacheDisk = $lun.CanonicalName
+        }
+        if(([int]($lun.CapacityGB)).toString() -eq "$NestedESXiCapacityvDisk") {
+            $vsanCapacityDisk = $lun.CanonicalName
+        }
+    }
+    My-Logger "Creating VSAN DiskGroup for $vmhost ..."
+    New-VsanDiskGroup -Server $vc -VMHost $vmhost -SsdCanonicalName $vsanCacheDisk -DataDiskCanonicalName $vsanCapacityDisk | Out-File -Append -LiteralPath $verboseLogFile
+}
+
+My-Logger "Clearing default VSAN Health Check Alarms, not applicable in Nested ESXi env ..."
+$alarmMgr = Get-View AlarmManager -Server $vc
+Get-Cluster -Server $vc | where {$_.ExtensionData.TriggeredAlarmState} | %{
+    $cluster = $_
+    $Cluster.ExtensionData.TriggeredAlarmState | %{
+        $alarmMgr.AcknowledgeAlarm($_.Alarm,$cluster.ExtensionData.MoRef)
+    }
+}
+$alarmSpec = New-Object VMware.Vim.AlarmFilterSpec
+$alarmMgr.ClearTriggeredAlarms($alarmSpec)
+
+# Final configure and then exit maintanence mode in case patching was done earlier
+
+foreach ($vmhost in Get-Cluster -Server $vc | Get-VMHost) {
+    # Disable Core Dump Warning
+    Get-AdvancedSetting -Entity $vmhost -Name UserVars.SuppressCoredumpWarning | Set-AdvancedSetting -Value 1 -Confirm:$false | Out-File -Append -LiteralPath $verboseLogFile
+
+    # Enable vMotion traffic
+    $vmhost | Get-VMHostNetworkAdapter -VMKernel | Set-VMHostNetworkAdapter -VMotionEnabled $true -Confirm:$false | Out-File -Append -LiteralPath $verboseLogFile
+
+    if($vmhost.ConnectionState -eq "Maintenance") {
+        Set-VMHost -VMhost $vmhost -State Connected -RunAsync -Confirm:$false | Out-File -Append -LiteralPath $verboseLogFile
+    }
+}
+
+    if($setupPacificStoragePolicy) {
+        $datastoreName = "vsanDatastore"
+
+        My-Logger "Creating Tanzu Storage Policies and attaching to $datastoreName ..."
+        New-TagCategory -Server $vc -Name $StoragePolicyTagCategory -Cardinality single -EntityType Datastore | Out-File -Append -LiteralPath $verboseLogFile
+        New-Tag -Server $vc -Name $StoragePolicyTagName -Category $StoragePolicyTagCategory | Out-File -Append -LiteralPath $verboseLogFile
+        Get-Datastore -Server $vc -Name $datastoreName | New-TagAssignment -Server $vc -Tag $StoragePolicyTagName | Out-File -Append -LiteralPath $verboseLogFile
+        New-SpbmStoragePolicy -Server $vc -Name $StoragePolicyName -AnyOfRuleSets (New-SpbmRuleSet -Name "tanzu-ruleset" -AllOfRules (New-SpbmRule -AnyOfTags (Get-Tag $StoragePolicyTagName))) | Out-File -Append -LiteralPath $verboseLogFile
+    }
+
+    My-Logger "Disconnecting from new VCSA ..."
+    Disconnect-VIServer $vc -Confirm:$false
+}
+
+if($configureVDS -eq 1) {
+        # vmnic0 = Management on VSS
+        # vmnic1 = unused
+        # vmnic2 = Management on VDS (uplink1)
+        # vmnic3 = Wrokload on VDS (uplink2)
+
+        $vds = New-VDSwitch -Server $vc -Name $NewVCVDSName -Location (Get-Datacenter -Name $NewVCDatacenterName) -Mtu 1600 -NumUplinkPorts 2
+
+        My-Logger "Creating VDS Management Network Portgroup"
+        New-VDPortgroup -Server $vc -Name $NewVCMgmtPortgroupName -Vds $vds | Out-File -Append -LiteralPath $verboseLogFile
+        Get-VDPortgroup -Server $vc $NewVCMgmtPortgroupName | Get-VDUplinkTeamingPolicy | Set-VDUplinkTeamingPolicy -ActiveUplinkPort @("dvUplink1") -UnusedUplinkPort @("dvUplink2") | Out-File -Append -LiteralPath $verboseLogFile
+
+        My-Logger "Creating VDS Supervisor Cluster Management Network Portgroup"
+        New-VDPortgroup -Server $vc -Name $NewVCWorkloadPortgroupName -Vds $vds | Out-File -Append -LiteralPath $verboseLogFile
+        Get-VDPortgroup -Server $vc $NewVCWorkloadPortgroupName | Get-VDUplinkTeamingPolicy | Set-VDUplinkTeamingPolicy -ActiveUplinkPort @("dvUplink2") -UnusedUplinkPort @("dvUplink1") | Out-File -Append -LiteralPath $verboseLogFile
+
+        foreach ($vmhost in Get-Cluster -Server $vc | Get-VMHost) {
+            My-Logger "Adding $vmhost to $NewVCVDSName"
+            $vds | Add-VDSwitchVMHost -VMHost $vmhost | Out-Null
+
+            $vmhostNetworkAdapter = Get-VMHost $vmhost | Get-VMHostNetworkAdapter -Physical -Name vmnic2,vmnic3
+            $vds | Add-VDSwitchPhysicalNetworkAdapter -VMHostNetworkAdapter $vmhostNetworkAdapter -Confirm:$false
+        }
+    }
+
+if($setupPacific -eq 1) {
+    My-Logger "Connecting to Management vCenter Server $VIServer for enabling Tanzu ..."
+    Connect-VIServer $VIServer -User $VIUsername -Password $VIPassword -WarningAction SilentlyContinue | Out-Null
+
+    My-Logger "Creating local $DevOpsUsername User in vCenter Server ..."
+    $devopsUserCreationCmd = "/usr/lib/vmware-vmafd/bin/dir-cli user create --account $DevOpsUsername --first-name `"Dev`" --last-name `"Ops`" --user-password `'$DevOpsPassword`' --login `'administrator@$VCSASSODomainName`' --password `'$VCSASSOPassword`'"
+    Invoke-VMScript -ScriptText $devopsUserCreationCmd -vm (Get-VM -Name $VCSADisplayName) -GuestUser "root" -GuestPassword "$VCSARootPassword" | Out-File -Append -LiteralPath $verboseLogFile
+
+    My-Logger "Disconnecting from Management vCenter ..."
+    Disconnect-VIServer * -Confirm:$false | Out-Null
+
+    $vc = Connect-VIServer $VCSAIPAddress -User "administrator@$VCSASSODomainName" -Password $VCSASSOPassword -WarningAction SilentlyContinue
+
+    My-Logger "Creating TKG Subscribed Content Library $TKGContentLibraryName ..."
+    $clScheme = ([System.Uri]$TKGContentLibraryURL).scheme
+    $clHost = ([System.Uri]$TKGContentLibraryURL).host
+    $clPort = ([System.Uri]$TKGContentLibraryURL).port
+    $clThumbprint = Get-SSLThumbprint -Url "${clScheme}://${clHost}:${clPort}"
+
+    New-ContentLibrary -Server $vc -Name $TKGContentLibraryName -Description "Subscribed TKG Content Library" -Datastore (Get-Datastore -Server $vc "vsanDatastore") -AutomaticSync -SubscriptionUrl $TKGContentLibraryURL -SslThumbprint $clThumbprint | Out-File -Append -LiteralPath $verboseLogFile
+
+    Disconnect-VIServer $vc -Confirm:$false | Out-Null
+}
+
+$EndTime = Get-Date
+$duration = [math]::Round((New-TimeSpan -Start $StartTime -End $EndTime).TotalMinutes,2)
+
+My-Logger "vSphere with Tanzu Basic Lab Deployment Complete!"
+My-Logger "StartTime: $StartTime"
+My-Logger "  EndTime: $EndTime"
+My-Logger " Duration: $duration minutes"
