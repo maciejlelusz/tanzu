@@ -31,7 +31,7 @@ $VMDatastore = "esxi-1-physical-ds3-nvme"
 $VMNetmask = "255.255.255.0"
 $VMGateway = "192.168.1.1"
 $VMDNS = "192.168.1.30"
-$VMNTP = "pl.pool.ntp.org"
+$VMNTP = @("time.vmware.com")
 $VMPassword = "VMware1!"
 $VMDomain = "int.inleo.pl"
 $VMSyslog = "192.168.1.30"
@@ -146,60 +146,61 @@ Function My-Logger {
     $logMessage | Out-File -Append -LiteralPath $verboseLogFile
 }
 
-    My-Logger "Connecting to Management vCenter Server $VIServer ..."
-    $viConnection = Connect-VIServer $VIServer -User $VIUsername -Password $VIPassword -WarningAction SilentlyContinue
+My-Logger "Connecting to Management vCenter Server $VIServer ..."
+$viConnection = Connect-VIServer $VIServer -User $VIUsername -Password $VIPassword -WarningAction SilentlyContinue
 
-    $datastore = Get-Datastore -Server $viConnection -Name $VMDatastore | Select -First 1
-    $cluster = Get-Cluster -Server $viConnection -Name $VMCluster
-    $datacenter = $cluster | Get-Datacenter
-    $vmhost = $cluster | Get-VMHost | Select -First 1
+$datastore = Get-Datastore -Server $viConnection -Name $VMDatastore | Select -First 1
+$cluster = Get-Cluster -Server $viConnection -Name $VMCluster
+$datacenter = $cluster | Get-Datacenter
+$vmhost = $cluster | Get-VMHost | Select -First 1
 
-    $NestedESXiHostnameToIPs.GetEnumerator() | Sort-Object -Property Value | Foreach-Object {
-        $VMName = $_.Key
-        $VMIPAddress = $_.Value
+$NestedESXiHostnameToIPs.GetEnumerator() | Sort-Object -Property Value | Foreach-Object {
+    $VMName = $_.Key
+    $VMIPAddress = $_.Value
 
-        $ovfconfig = Get-OvfConfiguration $NestedESXiApplianceOVA
-        $networkMapLabel = ($ovfconfig.ToHashTable().keys | where {$_ -Match "NetworkMapping"}).replace("NetworkMapping.","").replace("-","_").replace(" ","_")
-        $ovfconfig.NetworkMapping.$networkMapLabel.value = $VMNetwork
+    $ovfconfig = Get-OvfConfiguration $NestedESXiApplianceOVA
+    $networkMapLabel = ($ovfconfig.ToHashTable().keys | where {$_ -Match "NetworkMapping"}).replace("NetworkMapping.","").replace("-","_").replace(" ","_")
+    $ovfconfig.NetworkMapping.$networkMapLabel.value = $VMNetwork
 
-        $ovfconfig.common.guestinfo.hostname.value = $VMName
-        $ovfconfig.common.guestinfo.ipaddress.value = $VMIPAddress
-        $ovfconfig.common.guestinfo.netmask.value = $VMNetmask
-        $ovfconfig.common.guestinfo.gateway.value = $VMGateway
-        $ovfconfig.common.guestinfo.dns.value = $VMDNS
-        $ovfconfig.common.guestinfo.domain.value = $VMDomain
-        $ovfconfig.common.guestinfo.ntp.value = $VMNTP
-        $ovfconfig.common.guestinfo.syslog.value = $VMSyslog
-        $ovfconfig.common.guestinfo.password.value = $VMPassword
-        if($VMSSH -eq "true") {
-            $VMSSHVar = $true
-        } else {
-            $VMSSHVar = $false
-        }
-        $ovfconfig.common.guestinfo.ssh.value = $VMSSHVar
+    $ovfconfig.common.guestinfo.hostname.value = $VMName
+    $ovfconfig.common.guestinfo.ipaddress.value = $VMIPAddress
+    $ovfconfig.common.guestinfo.netmask.value = $VMNetmask
+    $ovfconfig.common.guestinfo.gateway.value = $VMGateway
+    $ovfconfig.common.guestinfo.dns.value = $VMDNS
+    $ovfconfig.common.guestinfo.domain.value = $VMDomain
+    $ovfconfig.common.guestinfo.ntp.value = $VMNTP
+    $ovfconfig.common.guestinfo.syslog.value = $VMSyslog
+    $ovfconfig.common.guestinfo.password.value = $VMPassword
+    
+    if($VMSSH -eq "true") {
+        $VMSSHVar = $true
+    } else {
+        $VMSSHVar = $false
+    }
+    $ovfconfig.common.guestinfo.ssh.value = $VMSSHVar
 
-        My-Logger "Deploying Nested ESXi VM $VMName ..."
-        $vm = Import-VApp -Source $NestedESXiApplianceOVA -OvfConfiguration $ovfconfig -Name $VMName -Location $cluster -VMHost $vmhost -Datastore $datastore -DiskStorageFormat thin
+    My-Logger "Deploying Nested ESXi VM $VMName ..."
+    $vm = Import-VApp -Source $NestedESXiApplianceOVA -OvfConfiguration $ovfconfig -Name $VMName -Location $cluster -VMHost $vmhost -Datastore $datastore -DiskStorageFormat thin
 
-        My-Logger "Adding vmnic2/vmnic3 for `"$VMNetwork`" and `"$HAProxyWorkloadNetwork`" to passthrough to Nested ESXi VMs ..."
-        New-NetworkAdapter -VM $vm -Type Vmxnet3 -NetworkName $VMNetwork -StartConnected -confirm:$false | Out-File -Append -LiteralPath $verboseLogFile
-        New-NetworkAdapter -VM $vm -Type Vmxnet3 -NetworkName $HAProxyWorkloadNetwork -StartConnected -confirm:$false | Out-File -Append -LiteralPath $verboseLogFile
+    My-Logger "Adding vmnic2/vmnic3 for `"$VMNetwork`" and `"$HAProxyWorkloadNetwork`" to passthrough to Nested ESXi VMs ..."
+    New-NetworkAdapter -VM $vm -Type Vmxnet3 -NetworkName $VMNetwork -StartConnected -confirm:$false | Out-File -Append -LiteralPath $verboseLogFile
+    New-NetworkAdapter -VM $vm -Type Vmxnet3 -NetworkName $HAProxyWorkloadNetwork -StartConnected -confirm:$false | Out-File -Append -LiteralPath $verboseLogFile
 
-        $vm | New-AdvancedSetting -name "ethernet2.filter4.name" -value "dvfilter-maclearn" -confirm:$false -ErrorAction SilentlyContinue | Out-File -Append -LiteralPath $verboseLogFile
-        $vm | New-AdvancedSetting -Name "ethernet2.filter4.onFailure" -value "failOpen" -confirm:$false -ErrorAction SilentlyContinue | Out-File -Append -LiteralPath $verboseLogFile
+    $vm | New-AdvancedSetting -name "ethernet2.filter4.name" -value "dvfilter-maclearn" -confirm:$false -ErrorAction SilentlyContinue | Out-File -Append -LiteralPath $verboseLogFile
+    $vm | New-AdvancedSetting -Name "ethernet2.filter4.onFailure" -value "failOpen" -confirm:$false -ErrorAction SilentlyContinue | Out-File -Append -LiteralPath $verboseLogFile
 
-        $vm | New-AdvancedSetting -name "ethernet3.filter4.name" -value "dvfilter-maclearn" -confirm:$false -ErrorAction SilentlyContinue | Out-File -Append -LiteralPath $verboseLogFile
-        $vm | New-AdvancedSetting -Name "ethernet3.filter4.onFailure" -value "failOpen" -confirm:$false -ErrorAction SilentlyContinue | Out-File -Append -LiteralPath $verboseLogFile
+    $vm | New-AdvancedSetting -name "ethernet3.filter4.name" -value "dvfilter-maclearn" -confirm:$false -ErrorAction SilentlyContinue | Out-File -Append -LiteralPath $verboseLogFile
+    $vm | New-AdvancedSetting -Name "ethernet3.filter4.onFailure" -value "failOpen" -confirm:$false -ErrorAction SilentlyContinue | Out-File -Append -LiteralPath $verboseLogFile
 
-        My-Logger "Updating vCPU Count to $NestedESXivCPU & vMEM to $NestedESXivMEM GB ..."
-        Set-VM -Server $viConnection -VM $vm -NumCpu $NestedESXivCPU -MemoryGB $NestedESXivMEM -Confirm:$false | Out-File -Append -LiteralPath $verboseLogFile
+    Set-VM -Server $viConnection -VM $vm -NumCpu $NestedESXivCPU -MemoryGB $NestedESXivMEM -Confirm:$false | Out-File -Append -LiteralPath $verboseLogFile
 
-        My-Logger "Updating vSAN Cache VMDK size to $NestedESXiCachingvDisk GB & Capacity VMDK size to $NestedESXiCapacityvDisk GB ..."
-        Get-HardDisk -Server $viConnection -VM $vm -Name "Hard disk 2" | Set-HardDisk -CapacityGB $NestedESXiCachingvDisk -Confirm:$false | Out-File -Append -LiteralPath $verboseLogFile
-        Get-HardDisk -Server $viConnection -VM $vm -Name "Hard disk 3" | Set-HardDisk -CapacityGB $NestedESXiCapacityvDisk -Confirm:$false | Out-File -Append -LiteralPath $verboseLogFile
+    My-Logger "Updating vSAN Cache VMDK size to $NestedESXiCachingvDisk GB & Capacity VMDK size to $NestedESXiCapacityvDisk GB ..."
+    Get-HardDisk -Server $viConnection -VM $vm -Name "Hard disk 2" | Set-HardDisk -CapacityGB $NestedESXiCachingvDisk -Confirm:$false | Out-File -Append -LiteralPath $verboseLogFile
+    Get-HardDisk -Server $viConnection -VM $vm -Name "Hard disk 3" | Set-HardDisk -CapacityGB $NestedESXiCapacityvDisk -Confirm:$false | Out-File -Append -LiteralPath $verboseLogFile
 
-        My-Logger "Powering On $vmname ..."
-        $vm | Start-Vm -RunAsync | Out-Null
+    My-Logger "Powering On $vmname ..."
+    $vm | Start-Vm -RunAsync | Out-Null
+}
 
 My-Logger "Creating vApp $VAppName ..."
 $VApp = New-VApp -Name $VAppName -Server $viConnection -Location $cluster
